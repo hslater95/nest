@@ -50,6 +50,7 @@ import {
 import { pathToRegexp } from 'path-to-regexp';
 // Fastify uses `fast-querystring` internally to quickly parse URL query strings.
 import { parse as querystringParse } from 'fast-querystring';
+import { safeDecodeURI } from 'find-my-way/lib/url-sanitizer';
 import {
   FASTIFY_ROUTE_CONFIG_METADATA,
   FASTIFY_ROUTE_CONSTRAINTS_METADATA,
@@ -60,6 +61,7 @@ import {
   FastifyStaticOptions,
   FastifyViewOptions,
 } from '../interfaces/external';
+import middie from './middie/fastify-middie';
 
 type FastifyAdapterBaseOptions<
   Server extends RawServerBase = RawServerDefault,
@@ -702,13 +704,20 @@ export class FastifyAdapter<
           normalizedPath,
           (req: any, res: any, next: Function) => {
             const queryParamsIndex = req.originalUrl.indexOf('?');
-            const pathname =
+            let pathname =
               queryParamsIndex >= 0
                 ? req.originalUrl.slice(0, queryParamsIndex)
                 : req.originalUrl;
 
-            if (!re.exec(pathname + '/') && normalizedPath) {
-              return next();
+            pathname = this.sanitizeUrl(pathname);
+
+            if (normalizedPath) {
+              const pathToCheck = pathname.endsWith('/')
+                ? pathname
+                : `${pathname}/`;
+              if (!re.exec(pathToCheck)) {
+                return next();
+              }
             }
             return callback(req, res, next);
           },
@@ -791,9 +800,7 @@ export class FastifyAdapter<
 
   private async registerMiddie() {
     this.isMiddieRegistered = true;
-    await this.register(
-      import('@fastify/middie') as Parameters<TInstance['register']>[0],
-    );
+    await this.register(middie as Parameters<TInstance['register']>[0]);
   }
 
   private getRequestOriginalUrl(rawRequest: TRawRequest) {
@@ -865,5 +872,51 @@ export class FastifyAdapter<
       }
     }
     return this.instance.route(routeToInject);
+  }
+
+  private sanitizeUrl(url: string): string {
+    const initialConfig = this.instance.initialConfig as FastifyServerOptions;
+    const routerOptions =
+      initialConfig.routerOptions as Partial<FastifyServerOptions>;
+
+    if (
+      routerOptions.ignoreDuplicateSlashes ||
+      initialConfig.ignoreDuplicateSlashes
+    ) {
+      url = this.removeDuplicateSlashes(url);
+    }
+
+    if (
+      routerOptions.ignoreTrailingSlash ||
+      initialConfig.ignoreTrailingSlash
+    ) {
+      url = this.trimLastSlash(url);
+    }
+
+    if (
+      routerOptions.caseSensitive === false ||
+      initialConfig.caseSensitive === false
+    ) {
+      url = url.toLowerCase();
+    }
+    return safeDecodeURI(
+      url,
+      routerOptions.useSemicolonDelimiter ||
+        initialConfig.useSemicolonDelimiter,
+    ).path;
+  }
+
+  private removeDuplicateSlashes(path: string) {
+    const REMOVE_DUPLICATE_SLASHES_REGEXP = /\/\/+/g;
+    return path.indexOf('//') !== -1
+      ? path.replace(REMOVE_DUPLICATE_SLASHES_REGEXP, '/')
+      : path;
+  }
+
+  private trimLastSlash(path: string) {
+    if (path.length > 1 && path.charCodeAt(path.length - 1) === 47) {
+      return path.slice(0, -1);
+    }
+    return path;
   }
 }

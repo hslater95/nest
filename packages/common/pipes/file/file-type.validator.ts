@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'url';
 import { Logger } from '../../services/logger.service';
 import { FileValidatorContext } from './file-validator-context.interface';
 import { FileValidator } from './file-validator.interface';
@@ -79,6 +80,21 @@ export class FileTypeValidator extends FileValidator<
         : errorMessage;
     }
 
+    /**
+     * If the file buffer is not available, and fallbackToMimetype is not enabled,
+     * we cannot perform magic number validation,
+     * so we return a specific error message indicating
+     * that validation could not be performed due to missing buffer.
+     */
+    if (
+      file?.mimetype &&
+      !file.buffer &&
+      !this.validationOptions?.fallbackToMimetype &&
+      !this.validationOptions?.skipMagicNumbersValidation
+    ) {
+      return `Validation failed (file buffer is not available; file type validation could not be performed; expected type is ${this.validationOptions.fileType})`;
+    }
+
     if (file?.mimetype) {
       const baseMessage = `Validation failed (current file type is ${file.mimetype}, expected type is ${this.validationOptions.fileType})`;
 
@@ -123,14 +139,15 @@ export class FileTypeValidator extends FileValidator<
     }
 
     try {
-      let fileTypePath: string;
+      let fileTypeModule: string;
       try {
-        fileTypePath = require.resolve('file-type');
+        const resolvedPath = require.resolve('file-type');
+        fileTypeModule = pathToFileURL(resolvedPath).href;
       } catch {
-        fileTypePath = 'file-type';
+        fileTypeModule = 'file-type';
       }
       const { fileTypeFromBuffer } =
-        await loadEsm<typeof import('file-type')>(fileTypePath);
+        await loadEsm<typeof import('file-type')>(fileTypeModule);
       const fileType = await fileTypeFromBuffer(file.buffer);
 
       if (fileType) {

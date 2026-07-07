@@ -3,6 +3,7 @@ import { expect } from 'chai';
 import { IncomingMessage, ServerResponse } from 'http';
 import { Observable, of, Subject } from 'rxjs';
 import * as sinon from 'sinon';
+import { EventEmitter } from 'events';
 import { PassThrough, Writable } from 'stream';
 import { HttpStatus, RequestMethod } from '../../../common';
 import { RouterResponseController } from '../../router/router-response-controller';
@@ -260,14 +261,30 @@ describe('RouterResponseController', () => {
     });
   });
   describe('Server-Sent-Events', () => {
+    const attachSocket = <T extends Writable>(request: T) =>
+      Object.assign(request, {
+        socket: Object.assign(new EventEmitter(), {
+          setKeepAlive() {},
+          setNoDelay() {},
+          setTimeout() {},
+        }),
+      }) as T & { socket: EventEmitter };
+
     it('should accept only observables', async () => {
       const result = Promise.resolve('test');
+      const response = new Writable();
+      response._write = () => {};
+
+      const request = new Writable();
+      request._write = () => {};
+
       try {
         await routerResponseController.sse(
           result as unknown as any,
-          {} as unknown as ServerResponse,
-          {} as unknown as IncomingMessage,
+          response as unknown as ServerResponse,
+          request as unknown as IncomingMessage,
         );
+        expect.fail('should have thrown');
       } catch (e) {
         expect(e.message).to.eql(
           'You must return an Observable stream to use Server-Sent Events (SSE).',
@@ -300,7 +317,7 @@ describe('RouterResponseController', () => {
 
       const result = Promise.resolve(of('test'));
       const response = new Sink();
-      const request = new PassThrough();
+      const request = attachSocket(new PassThrough());
       await routerResponseController.sse(
         result,
         response as unknown as ServerResponse,
@@ -334,7 +351,7 @@ data: test
 
       const result = of('test');
       const response = new SinkWithStatusCode();
-      const request = new PassThrough();
+      const request = attachSocket(new PassThrough());
       await routerResponseController.sse(
         result,
         response as unknown as ServerResponse,
@@ -370,13 +387,12 @@ data: test
 
       const result = of('test');
       const response = new Sink();
-      const request = new PassThrough();
-      void routerResponseController.sse(
+      const request = attachSocket(new PassThrough());
+      await routerResponseController.sse(
         result,
         response as unknown as ServerResponse,
         request as unknown as IncomingMessage,
       );
-      request.destroy();
       await written(response);
       expect(response.content).to.eql(
         `
@@ -387,13 +403,13 @@ data: test
       );
     });
 
-    it('should close on request close', done => {
+    it('should close on socket close', done => {
       const result = of('test');
       const response = new Writable();
       response.end = () => done() as any;
       response._write = () => {};
 
-      const request = new Writable();
+      const request = attachSocket(new Writable());
       request._write = () => {};
 
       void routerResponseController.sse(
@@ -401,7 +417,126 @@ data: test
         response as unknown as ServerResponse,
         request as unknown as IncomingMessage,
       );
-      request.emit('close');
+      request.socket.emit('close');
+    });
+
+    it('should subscribe and teardown a Promise<Observable> if socket closes before it resolves', async () => {
+      let subscribed = false;
+      const teardown = sinon.spy();
+      const result = new Promise<Observable<string>>(resolve => {
+        setTimeout(() => {
+          resolve(
+            new Observable(() => {
+              subscribed = true;
+              return teardown;
+            }),
+          );
+        }, 10);
+      });
+      const response = new Writable();
+      const responseEndSpy = sinon.spy();
+      response.end = responseEndSpy as any;
+      response._write = () => {};
+
+      const request = attachSocket(new PassThrough());
+
+      const ssePromise = routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+      request.socket.emit('close');
+
+      await ssePromise;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(subscribed).to.equal(true);
+      expect(teardown.calledOnce).to.equal(true);
+      expect(responseEndSpy.calledOnce).to.be.true;
+      expect(request.socket.listenerCount('close')).to.equal(0);
+    });
+
+    it('should tear down stream state initialized before an async SSE observable resolves', async () => {
+      let streamState = 'idle';
+
+      const result = new Promise<Observable<string>>(resolve => {
+        streamState = 'running';
+
+        setTimeout(() => {
+          resolve(
+            new Observable(() => () => {
+              streamState = 'stopped';
+            }),
+          );
+        }, 10);
+      });
+      const response = new Writable();
+      response.end = sinon.spy() as any;
+      response._write = () => {};
+
+      const request = attachSocket(new PassThrough());
+
+      const ssePromise = routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+      request.socket.emit('close');
+
+      await ssePromise;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(streamState).to.equal('stopped');
+    });
+
+    it('should not write headers or events after the socket closes before an async SSE observable resolves', async () => {
+      class SinkWithWriteHead extends Writable {
+        private readonly chunks: string[] = [];
+        writeHead = sinon.spy();
+        flushHeaders = sinon.spy();
+
+        _write(
+          chunk: any,
+          encoding: string,
+          callback: (error?: Error | null) => void,
+        ): void {
+          this.chunks.push(String(chunk));
+          callback();
+        }
+
+        get content() {
+          return this.chunks.join('');
+        }
+      }
+
+      const result = new Promise<Observable<string>>(resolve => {
+        setTimeout(() => {
+          resolve(
+            new Observable(subscriber => {
+              subscriber.next('late event');
+              subscriber.complete();
+            }),
+          );
+        }, 10);
+      });
+      const response = new SinkWithWriteHead();
+      const responseEndSpy = sinon.spy(response, 'end');
+      const request = attachSocket(new PassThrough());
+
+      const ssePromise = routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+      request.socket.emit('close');
+
+      await ssePromise;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(response.writeHead.called).to.equal(false);
+      expect(response.flushHeaders.called).to.equal(false);
+      expect(response.content).to.equal('');
+      expect(responseEndSpy.calledOnce).to.equal(true);
     });
 
     it('should close the request when observable completes', done => {
@@ -410,13 +545,76 @@ data: test
       response.end = done as any;
       response._write = () => {};
 
-      const request = new Writable();
+      const request = attachSocket(new Writable());
       request._write = () => {};
 
       void routerResponseController.sse(
         result,
         response as unknown as ServerResponse,
         request as unknown as IncomingMessage,
+      );
+    });
+
+    it('should remove the close listener after synchronous completion', async () => {
+      const result = of('test');
+      const response = new Writable();
+      response._write = () => {};
+
+      const request = attachSocket(new PassThrough());
+
+      await routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+
+      expect(request.socket.listenerCount('close')).to.equal(0);
+    });
+
+    it('should keep streaming when the request closes after body consumption', async () => {
+      class Sink extends Writable {
+        private readonly chunks: string[] = [];
+
+        _write(
+          chunk: any,
+          encoding: string,
+          callback: (error?: Error | null) => void,
+        ): void {
+          this.chunks.push(chunk);
+          callback();
+        }
+
+        get content() {
+          return this.chunks.join('');
+        }
+      }
+
+      const written = (stream: Writable) =>
+        new Promise((resolve, reject) =>
+          stream.on('error', reject).on('finish', resolve),
+        );
+
+      const result = of('test');
+      const response = new Sink();
+      const request = attachSocket(new PassThrough());
+
+      const ssePromise = routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+
+      request.emit('close');
+
+      await ssePromise;
+      await written(response);
+
+      expect(response.content).to.eql(
+        `
+id: 1
+data: test
+
+`,
       );
     });
 
@@ -510,25 +708,67 @@ data: test
       });
     });
 
-    describe('when there is an error', () => {
-      it('should close the request', done => {
+    it('should commit headers on next tick without waiting for first emission', async () => {
+      class SinkWithWriteHead extends Writable {
+        writeHead = sinon.spy();
+        flushHeaders = sinon.spy();
+
+        _write(
+          chunk: any,
+          encoding: string,
+          callback: (error?: Error | null) => void,
+        ): void {
+          callback();
+        }
+      }
+
+      const result = new Subject();
+      const response = new SinkWithWriteHead();
+      const request = new PassThrough();
+
+      void routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+
+      // Wait for microtasks (subscription) + macrotask (setTimeout(0))
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      expect(response.writeHead.called).to.be.true;
+      expect(response.writeHead.firstCall.args[0]).to.equal(200);
+
+      result.complete();
+      request.destroy();
+    });
+
+    describe('when there is an error before headers are committed', () => {
+      it('should reject the promise so the exception filter can set the status', async () => {
         const result = new Subject();
         const response = new Writable();
-        response.end = done as any;
         response._write = () => {};
 
         const request = new Writable();
         request._write = () => {};
 
-        void routerResponseController.sse(
+        const ssePromise = routerResponseController.sse(
           result,
           response as unknown as ServerResponse,
           request as unknown as IncomingMessage,
         );
 
         result.error(new Error('Some error'));
-      });
 
+        try {
+          await ssePromise;
+          expect.fail('should have rejected');
+        } catch (e) {
+          expect(e.message).to.equal('Some error');
+        }
+      });
+    });
+
+    describe('when there is an error after headers are committed', () => {
       it('should write the error message to the stream', async () => {
         class Sink extends Writable {
           private readonly chunks: string[] = [];
@@ -561,18 +801,19 @@ data: test
           request as unknown as IncomingMessage,
         );
 
+        // Yield so the internal `await Promise.resolve(result)` completes
+        // and the subscription is active before we emit.
+        await Promise.resolve();
+
+        result.next('first');
+        // Let the concatMap inner Promise resolve
+        await new Promise(resolve => setTimeout(resolve, 10));
         result.error(new Error('Some error'));
         request.destroy();
 
         await written(response);
-        expect(response.content).to.eql(
-          `
-event: error
-id: 1
-data: Some error
-
-`,
-        );
+        expect(response.content).to.contain('event: error');
+        expect(response.content).to.contain('data: Some error');
       });
     });
   });
